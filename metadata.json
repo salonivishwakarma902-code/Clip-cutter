@@ -1,0 +1,6 @@
+{
+  "name": "AI Video Cutter",
+  "description": "AI-powered smart video cutter with scene analysis, natural language chat, and verified local export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

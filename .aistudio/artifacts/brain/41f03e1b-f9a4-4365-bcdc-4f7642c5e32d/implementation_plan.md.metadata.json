@@ -1,0 +1,6 @@
+{
+  "summary": "Comprehensive architectural implementation plan for the AI Smart Video Cutter Android app. Covers local MediaExtractor/MediaMuxer cutting, OpenRouter primary with Gemini fallback routing, scene analysis, bilingual UI, and Room job persistence.",
+  "updatedAt": "2026-10-16T17:10:20.617462322Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
