@@ -52,7 +52,7 @@ data class MainUiState(
     val exportSuccessUri: String? = null,
     val exportErrorMessage: String? = null,
     val showExportDialog: Boolean = false,
-    val activeTab: Int = 0 // 0: Home/Import, 1: Timeline, 2: AI Chat, 3: History, 4: Settings
+    val showSettingsModal: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -74,17 +74,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
 
     init {
-        // Welcome message in AI Chat
+        // Welcome message in AI Voice & Chat Assistant
         val welcomeMsg = ChatMessage(
             id = UUID.randomUUID().toString(),
             sender = ChatSender.SYSTEM,
-            text = "Welcome to AI Smart Video Cutter! / एआई स्मार्ट वीडियो कटर में आपका स्वागत है!\n\nImport a video to begin. You can ask me to find funny moments, cut specific timestamps, or split scenes."
+            text = "Welcome to AI Voice & Smart Video Cutter! / एआई स्मार्ट वीडियो कटर में आपका स्वागत है!\n\nImport a video and speak or type your request (e.g., \"Cut all funny moments\", \"Extract 30s summary\", \"Remove silent parts\"). AI will cut all clips automatically!"
         )
         _uiState.update { it.copy(chatMessages = listOf(welcomeMsg)) }
     }
 
-    fun selectTab(tabIndex: Int) {
-        _uiState.update { it.copy(activeTab = tabIndex) }
+    fun toggleSettingsModal(show: Boolean) {
+        _uiState.update { it.copy(showSettingsModal = show) }
     }
 
     fun importVideo(context: Context, uri: Uri) {
@@ -95,15 +95,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (metaResult.isSuccess) {
                 val metadata = metaResult.getOrThrow()
                 val duration = metadata.durationMs
-                val defaultEndMs = duration.coerceAtMost(300000L) // Cap default view at 5 minutes
+                val defaultEndMs = duration.coerceAtMost(300000L)
 
                 _uiState.update {
                     it.copy(
                         videoMetadata = metadata,
                         selectionStartMs = 0L,
                         selectionEndMs = defaultEndMs,
-                        currentPlaybackMs = 0L,
-                        activeTab = 1 // Auto navigate to Timeline tab
+                        currentPlaybackMs = 0L
                     )
                 }
 
@@ -127,28 +126,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun updateSelection(startMs: Long, endMs: Long) {
-        val duration = _uiState.value.videoMetadata?.durationMs ?: 0L
-        val safeStart = startMs.coerceIn(0L, duration)
-        val safeEnd = endMs.coerceIn(safeStart + 500L, duration)
-
-        _uiState.update {
-            it.copy(
-                selectionStartMs = safeStart,
-                selectionEndMs = safeEnd
-            )
-        }
-    }
-
-    fun updatePlaybackPosition(ms: Long) {
-        _uiState.update { it.copy(currentPlaybackMs = ms) }
-    }
-
-    fun togglePlayback() {
-        _uiState.update { it.copy(isPlaying = !it.isPlaying) }
-    }
-
-    fun sendAiChatPrompt(userPrompt: String) {
+    fun sendAiChatPrompt(context: Context, userPrompt: String) {
         val metadata = _uiState.value.videoMetadata ?: return
         if (userPrompt.isBlank()) return
 
@@ -173,7 +151,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             val aiMsgText = if (analysis.isLocalFallback) {
-                "Analysis complete via ${analysis.providerUsed}.\nNote: Add API keys in Settings for LLM reasoning."
+                "AI Edit Plan prepared via ${analysis.providerUsed}.\n(Add OpenRouter/Gemini key in Settings for deeper LLM reasoning):"
             } else {
                 "AI Edit Plan generated via ${analysis.providerUsed}:"
             }
@@ -192,50 +170,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     isAiThinking = false
                 )
             }
+
+            // Automatically trigger batch cutting if proposed clips exist
+            if (analysis.editPlan.suggestedClips.isNotEmpty()) {
+                exportAllProposalsInBatch(context, analysis.editPlan.suggestedClips)
+            }
         }
     }
 
-    fun applyProposalToTimeline(proposal: ClipProposal) {
-        val duration = _uiState.value.videoMetadata?.durationMs ?: 0L
-        val safeStart = proposal.startMs.coerceIn(0L, duration)
-        val safeEnd = proposal.endMs.coerceIn(safeStart + 500L, duration)
+    fun exportProposalClip(context: Context, proposal: ClipProposal) {
+        exportClipInternal(context, proposal.startMs, proposal.endMs, proposal.title)
+    }
+
+    fun exportAllProposalsInBatch(context: Context, proposals: List<ClipProposal>) {
+        if (proposals.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            proposals.forEachIndexed { idx, clip ->
+                val title = clip.title.ifBlank { "Clip_${idx + 1}" }
+                exportClipInternalSync(context, clip.startMs, clip.endMs, title, idx + 1, proposals.size)
+            }
+        }
+    }
+
+    private fun exportClipInternal(context: Context, startMs: Long, endMs: Long, clipTitle: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            exportClipInternalSync(context, startMs, endMs, clipTitle, 1, 1)
+        }
+    }
+
+    private fun exportClipInternalSync(
+        context: Context,
+        startMs: Long,
+        endMs: Long,
+        clipTitle: String,
+        currentBatchIndex: Int,
+        totalBatchCount: Int
+    ) {
+        val metadata = _uiState.value.videoMetadata ?: return
+        val isReencode = keyStorage.frameAccurateReencode
+
+        if (endMs <= startMs) return
+
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val cleanTitle = clipTitle.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
+        val outputFileName = "${cleanTitle}_$timeStamp.mp4"
 
         _uiState.update {
             it.copy(
-                selectionStartMs = safeStart,
-                selectionEndMs = safeEnd,
-                activeTab = 1 // Switch to timeline to view clip
+                isExporting = true,
+                exportProgress = 10,
+                exportStageMessage = "Processing clip $currentBatchIndex of $totalBatchCount ($clipTitle)...",
+                exportSuccessUri = null,
+                exportErrorMessage = null,
+                showExportDialog = true
             )
         }
-    }
 
-    fun exportCurrentClip(context: Context) {
-        val metadata = _uiState.value.videoMetadata ?: return
-        val startMs = _uiState.value.selectionStartMs
-        val endMs = _uiState.value.selectionEndMs
-        val isReencode = keyStorage.frameAccurateReencode
-
-        if (endMs <= startMs) {
-            _uiState.update { it.copy(exportErrorMessage = "Invalid clip bounds: End time must be after start time") }
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val outputFileName = "Clip_$timeStamp.mp4"
-
-            _uiState.update {
-                it.copy(
-                    isExporting = true,
-                    exportProgress = 5,
-                    exportStageMessage = "Initializing export / निर्यात प्रारंभ...",
-                    exportSuccessUri = null,
-                    exportErrorMessage = null,
-                    showExportDialog = true
-                )
-            }
-
-            val jobId = jobRepository.insertJob(
+        val jobId = kotlinx.coroutines.runBlocking {
+            jobRepository.insertJob(
                 sourceUri = metadata.uriString,
                 sourceFileName = metadata.fileName,
                 sourceDurationMs = metadata.durationMs,
@@ -244,26 +236,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 outputFileName = outputFileName,
                 isReencodeMode = isReencode
             )
+        }
 
-            try {
-                val sourceUri = Uri.parse(metadata.uriString)
+        try {
+            val sourceUri = Uri.parse(metadata.uriString)
+            val exportDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+                ?: File(context.filesDir, "exports")
+            if (!exportDir.exists()) exportDir.mkdirs()
 
-                // Public Movies/Video directory or fallback to app private files
-                val exportDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-                    ?: File(context.filesDir, "exports")
-                if (!exportDir.exists()) exportDir.mkdirs()
+            val outputFile = File(exportDir, outputFileName)
 
-                val outputFile = File(exportDir, outputFileName)
-
-                jobRepository.updateProgress(jobId, 20, "Trimming media streams / मीडिया ट्रिमिंग...", JobStatus.CUTTING)
-                _uiState.update {
-                    it.copy(
-                        exportProgress = 30,
-                        exportStageMessage = "Executing stream extraction / स्ट्रीम निष्कर्षण..."
-                    )
-                }
-
-                val cutResult = AndroidMediaEngine.cutVideoLossless(
+            val cutResult = kotlinx.coroutines.runBlocking {
+                AndroidMediaEngine.cutVideoLossless(
                     context = context,
                     sourceUri = sourceUri,
                     startMs = startMs,
@@ -273,67 +257,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         _uiState.update { s ->
                             s.copy(
                                 exportProgress = percent,
-                                exportStageMessage = "Processing frames / प्रोसेसिंग... ($percent%)"
+                                exportStageMessage = "Trimming $clipTitle ($percent%)..."
                             )
                         }
                     }
                 )
+            }
 
-                if (cutResult.isSuccess) {
-                    val finalFile = cutResult.getOrThrow()
-                    _uiState.update {
-                        it.copy(
-                            exportProgress = 90,
-                            exportStageMessage = "Verifying playback integrity / सत्यापन जारी..."
-                        )
-                    }
+            if (cutResult.isSuccess) {
+                val finalFile = cutResult.getOrThrow()
+                val verifyResult = kotlinx.coroutines.runBlocking {
+                    AndroidMediaEngine.verifyOutput(finalFile)
+                }
 
-                    val verifyResult = AndroidMediaEngine.verifyOutput(finalFile)
+                if (verifyResult.isSuccess) {
+                    val outputUriStr = Uri.fromFile(finalFile).toString()
+                    val fileSize = finalFile.length()
 
-                    if (verifyResult.isSuccess) {
-                        val outputUriStr = Uri.fromFile(finalFile).toString()
-                        val fileSize = finalFile.length()
-
+                    kotlinx.coroutines.runBlocking {
                         jobRepository.markCompleted(jobId, outputUriStr, fileSize)
-
-                        _uiState.update {
-                            it.copy(
-                                isExporting = false,
-                                exportProgress = 100,
-                                exportStageMessage = "Export Completed & Verified / निर्यात पूर्ण एवं सत्यापित!",
-                                exportSuccessUri = outputUriStr
-                            )
-                        }
-                    } else {
-                        val verifyErr = verifyResult.exceptionOrNull()?.message ?: "Verification failed"
-                        jobRepository.markFailed(jobId, verifyErr)
-                        _uiState.update {
-                            it.copy(
-                                isExporting = false,
-                                exportErrorMessage = "Export Verification Failed: $verifyErr"
-                            )
-                        }
                     }
-                } else {
-                    val cutErr = cutResult.exceptionOrNull()?.message ?: "Cut execution failed"
-                    jobRepository.markFailed(jobId, cutErr)
+
                     _uiState.update {
                         it.copy(
                             isExporting = false,
-                            exportErrorMessage = "Export Failed: $cutErr"
+                            exportProgress = 100,
+                            exportStageMessage = "Successfully exported $totalBatchCount clip(s)!",
+                            exportSuccessUri = outputUriStr
+                        )
+                    }
+                } else {
+                    val verifyErr = verifyResult.exceptionOrNull()?.message ?: "Verification failed"
+                    kotlinx.coroutines.runBlocking {
+                        jobRepository.markFailed(jobId, verifyErr)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            isExporting = false,
+                            exportErrorMessage = "Verification Failed: $verifyErr"
                         )
                     }
                 }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during export job", e)
-                jobRepository.markFailed(jobId, e.message ?: "Unknown error")
+            } else {
+                val cutErr = cutResult.exceptionOrNull()?.message ?: "Cut execution failed"
+                kotlinx.coroutines.runBlocking {
+                    jobRepository.markFailed(jobId, cutErr)
+                }
                 _uiState.update {
                     it.copy(
                         isExporting = false,
-                        exportErrorMessage = "Export Error: ${e.message}"
+                        exportErrorMessage = "Export Failed: $cutErr"
                     )
                 }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during export job", e)
+            kotlinx.coroutines.runBlocking {
+                jobRepository.markFailed(jobId, e.message ?: "Unknown error")
+            }
+            _uiState.update {
+                it.copy(
+                    isExporting = false,
+                    exportErrorMessage = "Export Error: ${e.message}"
+                )
             }
         }
     }
@@ -345,6 +331,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 exportSuccessUri = null,
                 exportErrorMessage = null
             )
+        }
+    }
+
+    fun deleteJob(jobId: Long) {
+        viewModelScope.launch {
+            jobRepository.deleteJob(jobId)
         }
     }
 
@@ -362,6 +354,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         settingsRepository.setFrameAccurate(frameAccurate)
         settingsRepository.setMaxDurationMinutes(maxDuration)
         settingsRepository.setCloudConsentGranted(consent)
+        toggleSettingsModal(false)
     }
 
     companion object {
